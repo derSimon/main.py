@@ -2,8 +2,8 @@ fastapi
 uvicorn
 python-multipart
 pydantic
-yt-dlp>=2024.11.4
 openai
 anthropic
-ffmpeg-python
 cloudinary
+httpx
+ffmpeg-python

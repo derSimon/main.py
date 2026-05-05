@@ -9,6 +9,7 @@ import os
 import json
 import tempfile
 import glob
+import httpx
 
 from openai import AsyncOpenAI
 import anthropic
@@ -18,6 +19,8 @@ import cloudinary.uploader
 # ─── API Clients ───────────────────────────────
 whisper_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 claude_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+RAPIDAPI_HOST = "youtube-media-downloader.p.rapidapi.com"
 
 cloudinary.config(
     cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
@@ -43,97 +46,130 @@ def is_valid_youtube_url(url: str) -> bool:
     pattern = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)(/|$)"
     return bool(re.match(pattern, url))
 
+def extract_video_id(url: str) -> str:
+    patterns = [
+        r"youtube\.com/watch\?v=([a-zA-Z0-9_-]+)",
+        r"youtu\.be/([a-zA-Z0-9_-]+)",
+        r"youtube\.com/shorts/([a-zA-Z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    raise Exception("Video ID konnte nicht extrahiert werden")
+
 
 # ─────────────────────────────────────────────
-# SCHRITT 1a: Audio herunterladen
+# SCHRITT 1: Video-Info via RapidAPI holen
+# ─────────────────────────────────────────────
+async def get_video_info(video_id: str) -> dict:
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"https://{RAPIDAPI_HOST}/v2/video/details",
+            headers=headers,
+            params={"videoId": video_id}
+        )
+        data = response.json()
+        print(f"[get_video_info] status={response.status_code}")
+        return data
+
+
+# ─────────────────────────────────────────────
+# SCHRITT 1a: Audio herunterladen via RapidAPI
 # ─────────────────────────────────────────────
 async def download_audio(url: str, output_dir: str) -> str:
-    youtube_cookies = os.environ.get("YOUTUBE_COOKIES")
-    if youtube_cookies:
-        with open("/tmp/cookies.txt", "w") as f:
-            f.write(youtube_cookies)
-        print("[download_audio] Cookies written to /tmp/cookies.txt")
+    video_id = extract_video_id(url)
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST
+    }
 
-    cmd = [
-        "yt-dlp", "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "--extractor-args", "youtube:player_client=web",
-        "--extractor-args", "youtube:skip=hls",
-        "--socket-timeout", "30",
-        "--no-playlist",
-    ]
-    if youtube_cookies:
-        cmd += ["--cookies", "/tmp/cookies.txt"]
-    cmd += ["-o", "%(title)s.%(ext)s", url]
-    print(f"[download_audio] Running: {' '.join(cmd)}")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=output_dir
-    )
-    stdout, stderr = await proc.communicate()
-    stdout_text = stdout.decode(errors="replace")
-    stderr_text = stderr.decode(errors="replace")
-    print(f"[download_audio] returncode={proc.returncode}")
-    if stdout_text:
-        print(f"[download_audio] stdout: {stdout_text[:2000]}")
-    if stderr_text:
-        print(f"[download_audio] stderr: {stderr_text[:2000]}")
-    matches = glob.glob(os.path.join(output_dir, "*.mp3"))
-    if not matches:
-        raise Exception(
-            f"Audio-Download fehlgeschlagen (returncode={proc.returncode}): {stderr_text}"
+    # Audio-Download-URL holen
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"https://{RAPIDAPI_HOST}/v2/video/download",
+            headers=headers,
+            params={"videoId": video_id, "format": "mp3"}
         )
-    print(f"[download_audio] Downloaded: {matches[0]}")
-    return matches[0]
+        data = response.json()
+        print(f"[download_audio] API response: {json.dumps(data)[:500]}")
+
+        # Download-URL aus Response extrahieren
+        audio_url = None
+        if "audios" in data and data["audios"]:
+            audio_url = data["audios"][0].get("url")
+        elif "url" in data:
+            audio_url = data["url"]
+
+        if not audio_url:
+            raise Exception(f"Keine Audio-URL gefunden: {json.dumps(data)[:300]}")
+
+        # Audio-Datei herunterladen
+        audio_path = os.path.join(output_dir, "audio.mp3")
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as dl_client:
+            async with dl_client.stream("GET", audio_url) as stream:
+                with open(audio_path, "wb") as f:
+                    async for chunk in stream.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        raise Exception("Audio-Download fehlgeschlagen – Datei leer oder nicht vorhanden")
+
+    print(f"[download_audio] Downloaded: {audio_path} ({os.path.getsize(audio_path)} bytes)")
+    return audio_path
 
 
 # ─────────────────────────────────────────────
-# SCHRITT 1b: Video herunterladen
+# SCHRITT 1b: Video herunterladen via RapidAPI
 # ─────────────────────────────────────────────
 async def download_video(url: str, output_dir: str) -> str:
-    youtube_cookies = os.environ.get("YOUTUBE_COOKIES")
-    if youtube_cookies:
-        with open("/tmp/cookies.txt", "w") as f:
-            f.write(youtube_cookies)
-        print("[download_video] Cookies written to /tmp/cookies.txt")
+    video_id = extract_video_id(url)
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST
+    }
 
-    cmd = [
-        "yt-dlp",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
-        "--merge-output-format", "mp4",
-        "--extractor-args", "youtube:player_client=web",
-        "--extractor-args", "youtube:skip=hls",
-        "--socket-timeout", "30",
-        "--no-playlist",
-    ]
-    if youtube_cookies:
-        cmd += ["--cookies", "/tmp/cookies.txt"]
-    cmd += ["-o", "%(title)s.%(ext)s", url]
-    print(f"[download_video] Running: {' '.join(cmd)}")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=output_dir
-    )
-    stdout, stderr = await proc.communicate()
-    stdout_text = stdout.decode(errors="replace")
-    stderr_text = stderr.decode(errors="replace")
-    print(f"[download_video] returncode={proc.returncode}")
-    if stdout_text:
-        print(f"[download_video] stdout: {stdout_text[:2000]}")
-    if stderr_text:
-        print(f"[download_video] stderr: {stderr_text[:2000]}")
-    matches = glob.glob(os.path.join(output_dir, "*.mp4"))
-    if not matches:
-        raise Exception(
-            f"Video-Download fehlgeschlagen (returncode={proc.returncode}): {stderr_text}"
+    # Video-Download-URL holen
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"https://{RAPIDAPI_HOST}/v2/video/download",
+            headers=headers,
+            params={"videoId": video_id, "format": "mp4"}
         )
-    print(f"[download_video] Downloaded: {matches[0]}")
-    return matches[0]
+        data = response.json()
+        print(f"[download_video] API response: {json.dumps(data)[:500]}")
+
+        # Beste mp4 URL finden (höchste Auflösung)
+        video_url = None
+        if "videos" in data and data["videos"]:
+            # Sortiere nach Höhe/Qualität
+            videos = [v for v in data["videos"] if v.get("extension") == "mp4"]
+            if videos:
+                videos.sort(key=lambda x: x.get("height", 0), reverse=True)
+                video_url = videos[0].get("url")
+        elif "url" in data:
+            video_url = data["url"]
+
+        if not video_url:
+            raise Exception(f"Keine Video-URL gefunden: {json.dumps(data)[:300]}")
+
+        # Video-Datei herunterladen
+        video_path = os.path.join(output_dir, "video.mp4")
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as dl_client:
+            async with dl_client.stream("GET", video_url) as stream:
+                with open(video_path, "wb") as f:
+                    async for chunk in stream.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+
+    if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+        raise Exception("Video-Download fehlgeschlagen – Datei leer oder nicht vorhanden")
+
+    print(f"[download_video] Downloaded: {video_path} ({os.path.getsize(video_path)} bytes)")
+    return video_path
 
 
 # ─────────────────────────────────────────────
@@ -187,7 +223,7 @@ Antworte NUR mit einem JSON-Array, ohne weitere Erklärungen, ohne Markdown:
 
 
 # ─────────────────────────────────────────────
-# SCHRITT 4: Clips schneiden (FFmpeg 9:16)
+# SCHRITT 4: Clips schneiden (FFmpeg 9:16 Smart Crop)
 # ─────────────────────────────────────────────
 async def cut_clips(video_path: str, moments: list, output_dir: str) -> list:
     clip_paths = []
@@ -305,8 +341,6 @@ HTML = """<!DOCTYPE html>
   .btn-primary{width:100%;padding:18px;background:var(--accent);color:#fff;border:none;border-radius:12px;font-family:'Syne',sans-serif;font-weight:700;font-size:15px;letter-spacing:.05em;text-transform:uppercase;cursor:pointer;transition:transform .15s,box-shadow .15s}
   .btn-primary:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 8px 32px rgba(255,61,61,.35)}
   .btn-primary:disabled{opacity:.5;cursor:not-allowed}
-
-  /* Status Card */
   .status-card{margin-top:24px;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;display:none;animation:slideUp .3s ease}
   .status-card.visible{display:block}
   @keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
@@ -320,15 +354,11 @@ HTML = """<!DOCTYPE html>
   .step-dot{width:6px;height:6px;border-radius:50%;background:var(--border);flex-shrink:0;transition:background .3s}
   .step.active .step-dot{background:var(--accent);box-shadow:0 0 8px var(--accent)}
   .step.done .step-dot{background:var(--success)}
-
-  /* Preview Section */
   .preview-section{margin-top:32px;display:none}
   .preview-section.visible{display:block;animation:slideUp .4s ease}
   .preview-title{font-family:'Syne',sans-serif;font-weight:800;font-size:22px;margin-bottom:6px}
   .preview-subtitle{color:var(--muted);font-size:13px;margin-bottom:24px}
   .clips-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px}
-
-  /* Clip Card */
   .clip-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;transition:border-color .2s}
   .clip-card:hover{border-color:#333}
   .video-wrapper{position:relative;background:#000;aspect-ratio:9/16}
@@ -348,7 +378,6 @@ HTML = """<!DOCTYPE html>
   .clip-status.uploading{display:block;background:rgba(255,214,10,.1);color:var(--warning)}
   .clip-status.uploaded{display:block;background:rgba(61,255,143,.1);color:var(--success)}
   .clip-status.rejected{display:block;background:rgba(255,61,61,.1);color:var(--accent)}
-
   .error-msg{color:var(--accent);font-size:13px;margin-top:8px;display:none}
   .footer{margin-top:48px;font-size:12px;color:#333;text-align:center;padding-bottom:40px}
 </style>
@@ -358,7 +387,6 @@ HTML = """<!DOCTYPE html>
   <div class="logo">◆ Shorts Generator</div>
   <h1>Dreh jedes <span>Video in Shorts.</span></h1>
   <p class="subtitle">YouTube-Link einfügen – Claude findet die besten Momente, du entscheidest welche gepostet werden.</p>
-
   <div class="input-group">
     <div class="input-wrapper">
       <svg class="yt-icon" viewBox="0 0 24 24" fill="none"><path d="M22.54 6.42C22.42 5.95 22.18 5.51 21.84 5.16C21.5 4.81 21.07 4.55 20.6 4.42C18.88 4 12 4 12 4C12 4 5.12 4 3.4 4.46C2.93 4.59 2.5 4.85 2.16 5.2C1.82 5.55 1.58 5.99 1.46 6.46C1.15 8.21 0.99 9.98 1 11.75C0.99 13.54 1.14 15.32 1.46 17.08C1.59 17.54 1.84 17.96 2.18 18.29C2.52 18.63 2.94 18.87 3.4 19C5.12 19.46 12 19.46 12 19.46C12 19.46 18.88 19.46 20.6 19C21.07 18.87 21.5 18.61 21.84 18.26C22.18 17.91 22.42 17.47 22.54 17C22.85 15.27 23.01 13.51 23 11.75C23.01 9.96 22.85 8.18 22.54 6.42Z" fill="currentColor"/><path d="M9.75 15.02L15.5 11.75L9.75 8.48V15.02Z" fill="#0a0a0a"/></svg>
@@ -367,8 +395,6 @@ HTML = """<!DOCTYPE html>
     <button class="btn-primary" id="startBtn" onclick="startWorkflow()">Workflow starten →</button>
     <p class="error-msg" id="errorMsg">⚠️ Bitte eine gültige YouTube-URL eingeben.</p>
   </div>
-
-  <!-- Status Card -->
   <div class="status-card" id="statusCard">
     <div class="status-label">Status</div>
     <div class="status-message" id="statusMessage">🚀 Workflow gestartet!</div>
@@ -383,22 +409,17 @@ HTML = """<!DOCTYPE html>
       <div class="step" id="step-done"><span class="step-dot"></span>Vorschau bereit!</div>
     </div>
   </div>
-
-  <!-- Preview Section -->
   <div class="preview-section" id="previewSection">
     <div class="preview-title">🎬 Deine Clips</div>
     <p class="preview-subtitle">Schau dir jeden Clip an und entscheide selbst was gepostet wird.</p>
     <div class="clips-grid" id="clipsGrid"></div>
   </div>
-
   <div class="footer">Powered by FastAPI · Railway · Whisper · Claude · Cloudinary</div>
 </div>
-
 <script>
   const STEPS=['started','downloading','transcribing','analyzing','cutting','uploading','done'];
   const PROGRESS={started:5,downloading:20,transcribing:40,analyzing:60,cutting:78,uploading:90,done:100};
   let pollInterval=null;
-
   async function startWorkflow(){
     const url=document.getElementById('urlInput').value.trim();
     const errorMsg=document.getElementById('errorMsg');
@@ -416,7 +437,6 @@ HTML = """<!DOCTYPE html>
       pollStatus(data.job_id);
     }catch(e){errorMsg.textContent='⚠️ Server nicht erreichbar.';errorMsg.style.display='block';btn.disabled=false;btn.textContent='Workflow starten →';}
   }
-
   function updateUI(status){
     document.getElementById('statusMessage').textContent=status.message;
     document.getElementById('progressFill').style.width=(PROGRESS[status.status]||5)+'%';
@@ -438,7 +458,6 @@ HTML = """<!DOCTYPE html>
       document.getElementById('startBtn').textContent='Erneut versuchen →';
     }
   }
-
   function showPreviews(clips){
     const grid=document.getElementById('clipsGrid');
     grid.innerHTML='';
@@ -465,27 +484,19 @@ HTML = """<!DOCTYPE html>
     document.getElementById('previewSection').classList.add('visible');
     window.scrollTo({top:document.getElementById('previewSection').offsetTop-20,behavior:'smooth'});
   }
-
-  function approveClip(idx, url, publicId){
+  function approveClip(idx,url,publicId){
     const statusEl=document.getElementById('status-'+idx);
     const card=document.getElementById('card-'+idx);
     statusEl.className='clip-status uploading';
     statusEl.textContent='⏳ Wird vorbereitet...';
     card.querySelectorAll('button').forEach(b=>b.disabled=true);
-    // Hier später: echter Social Media Upload
-    // Für jetzt: Download des Clips
     setTimeout(()=>{
       statusEl.className='clip-status uploaded';
       statusEl.textContent='✓ Bereit zum Download';
-      // Download starten
       const a=document.createElement('a');
-      a.href=url;
-      a.download=`clip_${idx+1}.mp4`;
-      a.target='_blank';
-      a.click();
+      a.href=url;a.download=`clip_${idx+1}.mp4`;a.target='_blank';a.click();
     },1000);
   }
-
   function rejectClip(idx){
     const statusEl=document.getElementById('status-'+idx);
     const card=document.getElementById('card-'+idx);
@@ -494,14 +505,12 @@ HTML = """<!DOCTYPE html>
     card.querySelectorAll('button').forEach(b=>b.disabled=true);
     card.style.opacity='0.4';
   }
-
   function pollStatus(jobId){
     pollInterval=setInterval(async()=>{
       try{const res=await fetch('/status/'+jobId);const data=await res.json();updateUI(data);}
       catch(e){}
     },1500);
   }
-
   document.addEventListener('DOMContentLoaded',()=>{
     document.getElementById('urlInput').addEventListener('keydown',e=>{if(e.key==='Enter')startWorkflow();});
   });
