@@ -88,19 +88,26 @@ async def get_video_details(video_id: str) -> dict:
 # SCHRITT 1a: Audio herunterladen
 # ─────────────────────────────────────────────
 async def download_audio(video_details: dict, output_dir: str) -> str:
-    # Audio URL aus den Details extrahieren
     audio_url = None
     audios = video_details.get("audios", [])
+    print(f"[download_audio] audios type={type(audios)}, count={len(audios)}")
     if audios:
-        # Erste verfügbare Audio-URL nehmen
+        first = audios[0]
+        print(f"[download_audio] first audio type={type(first)}, value={str(first)[:200]}")
         for audio in audios:
-            url = audio.get("url")
-            if url:
+            # Kann ein Dict oder ein String sein
+            if isinstance(audio, dict):
+                url = audio.get("url")
+            elif isinstance(audio, str):
+                url = audio
+            else:
+                continue
+            if url and url.startswith("http"):
                 audio_url = url
                 break
 
     if not audio_url:
-        raise Exception(f"Keine Audio-URL in Video-Details gefunden. Keys: {list(video_details.keys())}")
+        raise Exception(f"Keine Audio-URL gefunden. audios={str(audios)[:300]}")
 
     print(f"[download_audio] Downloading from URL...")
     audio_path = os.path.join(output_dir, "audio.mp3")
@@ -122,21 +129,37 @@ async def download_audio(video_details: dict, output_dir: str) -> str:
 # SCHRITT 1b: Video herunterladen
 # ─────────────────────────────────────────────
 async def download_video(video_details: dict, output_dir: str) -> str:
-    # Beste Video-URL aus den Details extrahieren
     video_url = None
     videos = video_details.get("videos", [])
+    print(f"[download_video] videos type={type(videos)}, count={len(videos)}")
     if videos:
-        # Sortiere nach Höhe (Qualität) absteigend
-        sorted_videos = sorted(videos, key=lambda x: x.get("height", 0), reverse=True)
+        first = videos[0]
+        print(f"[download_video] first video type={type(first)}, value={str(first)[:200]}")
+        # Versuche nach Qualität zu sortieren wenn möglich
+        try:
+            sorted_videos = sorted(
+                videos,
+                key=lambda x: x.get("height", 0) if isinstance(x, dict) else 0,
+                reverse=True
+            )
+        except Exception:
+            sorted_videos = videos
         for video in sorted_videos:
-            url = video.get("url")
-            if url:
+            if isinstance(video, dict):
+                url = video.get("url")
+                height = video.get("height", "?")
+            elif isinstance(video, str):
+                url = video
+                height = "?"
+            else:
+                continue
+            if url and url.startswith("http"):
                 video_url = url
-                print(f"[download_video] Selected quality: {video.get('height')}p")
+                print(f"[download_video] Selected quality: {height}p")
                 break
 
     if not video_url:
-        raise Exception(f"Keine Video-URL in Video-Details gefunden. Keys: {list(video_details.keys())}")
+        raise Exception(f"Keine Video-URL gefunden. videos={str(videos)[:300]}")
 
     print(f"[download_video] Downloading from URL...")
     video_path = os.path.join(output_dir, "video.mp4")
